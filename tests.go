@@ -56,6 +56,12 @@ var testSuite = []testCase{
 
 func runTests(ctx context.Context, l *slog.Logger, to TestOptions) error {
 	l = l.With("sni", to.SNI, "port", to.Port)
+	
+	l.Debug("starting test suite execution", 
+		"resolve_ipv4", to.ResolveIPv4,
+		"resolve_ipv6", to.ResolveIPv6,
+		"manual_ip", to.ManualIP,
+		"repeat_count", to.Repeat)
 
 	testAddrPorts := []netip.AddrPort{}
 	if to.ManualIP == netip.IPv4Unspecified() {
@@ -65,45 +71,77 @@ func runTests(ctx context.Context, l *slog.Logger, to TestOptions) error {
 		var err error
 		v4, v6, err := resolve(ctx, to.SNI, to.ResolveIPv4, to.ResolveIPv6)
 		if err != nil {
+			l.Error("DNS resolution failed", "error", err)
 			return fmt.Errorf("failed to resolve SNI: %w", err)
 		}
 
+		l.Debug("DNS resolution completed", "ipv4", v4, "ipv6", v6)
+
 		if to.ResolveIPv4 && v4 != netip.IPv4Unspecified() {
 			testAddrPorts = append(testAddrPorts, netip.AddrPortFrom(v4, to.Port))
+			l.Debug("added IPv4 address to test targets", "ipv4", v4)
 		}
 
 		if to.ResolveIPv6 && v6 != netip.IPv6Unspecified() {
 			testAddrPorts = append(testAddrPorts, netip.AddrPortFrom(v6, to.Port))
+			l.Debug("added IPv6 address to test targets", "ipv6", v6)
 		}
 	} else {
-		l.Debug("manual IP specified, proceeding with the provided IP")
+		l.Debug("manual IP specified, proceeding with the provided IP", "manual_ip", to.ManualIP)
 		testAddrPorts = append(testAddrPorts, netip.AddrPortFrom(to.ManualIP, to.Port))
 	}
+
+	l.Debug("test targets determined", "target_count", len(testAddrPorts), "targets", testAddrPorts)
 
 	results := make(map[string][]TestResult)
 	labelOrder := make([]string, 0, len(testSuite))
 
-	for _, tc := range testSuite {
+	l.Debug("starting test execution", "test_count", len(testSuite))
+	for i, tc := range testSuite {
+		l.Debug("executing test", "test_index", i+1, "test_name", tc.label, "test_count", len(testSuite))
+		
 		test := tc.fn
 		resultsPerTest := make([]TestResult, len(testAddrPorts))
 		for x, addrPort := range testAddrPorts {
+			l.Debug("testing target", "target_index", x+1, "target", addrPort.String())
+			
 			tr := TestResult{AddrPort: addrPort, SNI: to.SNI, Attempts: make([]TestAttemptResult, to.Repeat)}
-			for i := uint(0); i < to.Repeat; i++ {
+			for j := uint(0); j < to.Repeat; j++ {
+				l.Debug("executing test attempt", "attempt", j+1, "total_attempts", to.Repeat)
+				
 				// Create a context with 10-second timeout for each individual test
 				testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				tr.Attempts[i] = test(testCtx, l, addrPort, to.SNI)
+				tr.Attempts[j] = test(testCtx, l, addrPort, to.SNI)
 				cancel() // Always cancel to release resources
-				time.Sleep(2 * time.Second)
+				
+				if tr.Attempts[j].err != nil {
+					l.Debug("test attempt failed", "attempt", j+1, "error", tr.Attempts[j].err)
+				} else {
+					l.Debug("test attempt succeeded", "attempt", j+1, 
+						"transport_duration", tr.Attempts[j].TransportEstablishDuration,
+						"tls_duration", tr.Attempts[j].TLSHandshakeDuration)
+				}
+				
+				if j < to.Repeat-1 {
+					l.Debug("waiting between attempts", "wait_duration", "2s")
+					time.Sleep(2 * time.Second)
+				}
 			}
 			resultsPerTest[x] = tr
 		}
 		results[tc.label] = resultsPerTest
 		labelOrder = append(labelOrder, tc.label)
-		// 2-second delay between different test types
-		time.Sleep(2 * time.Second)
+		
+		if i < len(testSuite)-1 {
+			l.Debug("waiting between test types", "wait_duration", "2s")
+			// 2-second delay between different test types
+			time.Sleep(2 * time.Second)
+		}
 	}
 
+	l.Debug("all tests completed, generating results table")
 	printTable(results, labelOrder)
+	l.Debug("test suite execution completed")
 
 	return nil
 }
